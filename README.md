@@ -1,3 +1,22 @@
+## Bootcamp IBM Confluent - Dados em tempo real para agentes de IA.
+
+<img width="120" height="120" alt="1000135685" src="https://github.com/user-attachments/assets/7696b416-285d-4c3f-8155-f4e92c7019f0" />
+
+---
+
+## DESCRIÇÃO:
+
+Chegou a hora de montar um pipeline de pagamentos que roda em tempo real no Confluent Cloud. 
+
+> Você leva os dados de um Postgres para o streaming por CDC, processa com Flink SQL para enriquecer as transações e marcar as suspeitas, e entrega o resultado para quem vai consumir. 
+
+> São cinco camadas, da fundação do ambiente até a operação com métricas e custo, e os dados sintéticos já vêm prontos para você começar. 
+
+> No fim, você publica um repositório no GitHub com o README documentando camada por camada, com a evidência de que cada uma rodou.
+
+
+---
+
 # Pipeline de pagamentos em tempo real
 
 Pipeline de referência para capturar transações PostgreSQL por CDC, validar contratos Avro, enriquecer o fluxo no Confluent Cloud for Apache Flink e emitir alertas de risco. O foco é demonstrar o caminho e as decisões de engenharia com passos reprodutíveis; evidências de execução e custo só podem ser preenchidas depois de executar na sua própria conta.
