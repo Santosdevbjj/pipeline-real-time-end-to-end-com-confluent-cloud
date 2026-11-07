@@ -1,139 +1,247 @@
-## Bootcamp IBM Confluent - Dados em tempo real para agentes de IA.
+# Pipeline de Pagamentos em Tempo Real com Confluent Cloud
 
-<img width="120" height="120" alt="1000135685" src="https://github.com/user-attachments/assets/7696b416-285d-4c3f-8155-f4e92c7019f0" />
+<img width="120" height="120" alt="Bootcamp IBM Confluent" src="https://github.com/user-attachments/assets/7696b416-285d-4c3f-8155-f4e92c7019f0" />
 
----
+**Bootcamp IBM Confluent — Dados em tempo real para agentes de IA**
 
-## DESCRIÇÃO:
-
-Chegou a hora de montar um pipeline de pagamentos que roda em tempo real no Confluent Cloud. 
-
-> Você leva os dados de um Postgres para o streaming por CDC, processa com Flink SQL para enriquecer as transações e marcar as suspeitas, e entrega o resultado para quem vai consumir. 
-> São cinco camadas, da fundação do ambiente até a operação com métricas e custo, e os dados sintéticos já vêm prontos para você começar. 
-> No fim, você publica um repositório no GitHub com o README documentando camada por camada, com a evidência de que cada uma rodou.
-
+> **Estado da entrega:** implementação e roteiro prontos. Os blocos de `evidence/` contêm instruções e modelos; **não afirmam** que recursos cloud foram provisionados. Nenhuma métrica de latência, taxa de alerta ou custo é apresentada aqui sem ter sido medida em uma execução real.
 
 ---
 
-# Pipeline de pagamentos em tempo real
+## Visão geral
 
-Pipeline de referência para capturar transações PostgreSQL por CDC, validar contratos Avro, enriquecer o fluxo no Confluent Cloud for Apache Flink e emitir alertas de risco. O foco é demonstrar o caminho e as decisões de engenharia com passos reprodutíveis; evidências de execução e custo só podem ser preenchidas depois de executar na sua própria conta.
+Pipeline de referência que captura transações de um PostgreSQL por **CDC**, valida contratos **Avro** no Schema Registry, enriquece e analisa o fluxo com **Flink SQL** no Confluent Cloud e publica um **alerta de risco** quando um mesmo cartão faz **3 ou mais transações em 60 segundos**.
 
-> **Estado da entrega:** implementação e roteiro prontos. Os blocos `evidence/` contêm instruções e modelos; não afirmam que recursos cloud foram provisionados. Não publique credenciais nem substitua evidências por saídas inventadas.
+O foco não é "usar Kafka e Flink", e sim resolver um problema: **sinalizar pagamentos suspeitos enquanto ainda dá tempo de revisá-los**, com decisões de engenharia justificadas e passos reproduzíveis.
 
-## Problema de negócio
+## Objetivo do projeto
 
-Pagamentos suspeitos precisam ser detectados enquanto ainda podem ser revisados. Processamentos em lote aumentam a latência entre a atividade do cartão e a sinalização. Este projeto entrega um evento de alerta quando um cartão apresenta três ou mais transações em uma janela de 60 segundos, enriquecendo-o com dados da conta.
+Montar, camada por camada, um pipeline de pagamentos em streaming e documentar cada decisão, trade-off e ponto de operação (segurança, custo e teardown). O projeto foi construído no bootcamp para praticar cinco camadas: fundação, contrato, ingestão, processamento e operação.
 
-## Contexto e baseline
+---
 
-O domínio usa dados sintéticos determinísticos, sem dados pessoais reais. A baseline operacional é a ausência de detecção contínua: eventos são avaliados individualmente e não existe alerta por frequência em janela. Não há alegação de redução de fraude ou de latência medida antes da execução; essas métricas devem ser coletadas no ambiente do operador.
+## 1. Problema de negócio
 
-## Premissas
+Pagamentos suspeitos precisam ser detectados enquanto ainda podem ser revisados. Processamento em lote aumenta a latência entre a atividade do cartão e a sinalização. Este projeto entrega um evento de alerta quando um cartão apresenta três ou mais transações em uma janela de 60 segundos, já enriquecido com dados da conta (`risk_tier`).
 
-- PostgreSQL é a fonte da verdade; `transactions` tem chave primária estável e `updated_at`.
-- Debezium PostgreSQL publica eventos CDC com envelope Debezium e tombstones Kafka para exclusões.
-- O conector precisa alcançar o PostgreSQL pela rede. Use um banco gerenciado com TLS e publicação lógica habilitada; não exponha uma instância local à internet.
-- `amount` é armazenado em centavos inteiros e convertido para decimal na camada analítica.
-- A regra é heurística de triagem, não decisão automática de fraude. A janela é processada por cartão.
-- Custos e disponibilidade dependem de região, tiers, retenção e tempo de execução na conta Confluent.
+## 2. Contexto e baseline
 
-## Planejamento da solução
+- **Contexto:** o domínio usa dados sintéticos determinísticos, sem dados pessoais reais.
+- **Baseline:** hoje não há detecção contínua. Cada evento é avaliado individualmente e não existe alerta por frequência em janela.
+- **O que a solução precisa superar:** a ausência de alerta por frequência. A comparação numérica (latência antes x depois, redução de fraude) **só é possível com medição no ambiente do operador**; este repositório não alega nenhum ganho medido.
+
+## 3. Premissas
+
+- O PostgreSQL é a fonte da verdade; `transactions` tem chave primária estável e `updated_at`.
+- O Debezium publica eventos CDC com envelope (`before`/`after`/`op`) e tombstones Kafka para exclusões.
+- O conector gerenciado precisa **alcançar o PostgreSQL pela rede** (banco gerenciado com TLS e replicação lógica). Ele não acessa o `localhost` da sua máquina.
+- `amount_minor` é armazenado em centavos inteiros (BIGINT) e convertido para decimal na camada analítica.
+- A regra é uma **heurística de triagem**, não uma decisão automática de fraude. A janela é calculada por cartão.
+- Custos e disponibilidade dependem de região, tier, retenção e tempo de execução na conta Confluent.
+
+---
+
+## 4. Planejamento da solução
+
+### Arquitetura
+
+```mermaid
+flowchart LR
+  PG[(PostgreSQL)] -->|WAL / logical replication| CDC[Confluent Postgres CDC]
+  CDC -->|Avro CDC envelopes| T1[(payments.public.transactions)]
+  CDC -->|Avro CDC envelopes| T2[(payments.public.accounts)]
+  SR[(Schema Registry)] -. contracts .- CDC
+  T1 --> F[Flink SQL]
+  T2 --> F
+  SR -. schemas .- F
+  F -->|upsert alert| A[(payments.fraud.alerts)]
+  A --> C[Consumer / risk review]
+```
+
+### Camadas
 
 | Camada | Componente | Responsabilidade |
 |---|---|---|
-| Fundação | Confluent Cloud, ambiente/cluster, service accounts e ACLs | Identidades de escrita/leitura com privilégio mínimo |
-| Contrato | Schema Registry + Avro | Evolução compatível e campos sensíveis minimizados |
-| Ingestão | PostgreSQL + Debezium CDC | Capturar insert/update/delete sem polling |
-| Processamento | Flink SQL | Desembrulhar CDC, enriquecer e detectar frequência |
-| Operação | métricas, ACL audit, billing e runbook | Observar, proteger, estimar custo e encerrar recursos |
+| 1. Fundação | Confluent Cloud, ambiente/cluster, service accounts e ACLs (Terraform) | Identidades de escrita/leitura com privilégio mínimo |
+| 2. Contrato | Schema Registry + Avro | Evolução compatível e campos sensíveis minimizados |
+| 3. Ingestão | PostgreSQL + Debezium CDC (`PostgresCdcSourceV2`) | Capturar insert/update/delete sem polling |
+| 4. Processamento | Flink SQL | Desembrulhar CDC, enriquecer e detectar frequência |
+| 5. Operação | Métricas, auditoria de ACLs, billing e runbook | Observar, proteger, estimar custo e encerrar recursos |
 
-O roteiro foi desenhado para Confluent Cloud. A forma recomendada de prova local é validar o PostgreSQL/seed antes de conectar um endpoint PostgreSQL acessível pelo conector cloud. O conector gerenciado não consegue acessar `localhost` do computador do operador.
+### Tecnologias
 
-## Limpeza e qualidade dos dados
+- Confluent Cloud (Kafka, Schema Registry, Flink SQL, conector gerenciado)
+- PostgreSQL com `wal_level=logical` e `pgoutput`
+- Avro como formato de contrato
+- Terraform (provider `confluentinc/confluent ~> 2.0`)
+- PowerShell 7 e Confluent CLI para scripts e operação
 
-O seed usa dados sintéticos com IDs fixos e timestamps relativos ao instante de carga. As tabelas aplicam PK, FK, `NOT NULL`, moeda ISO e valores positivos. No stream, mensagens inválidas ou sem campos necessários são excluídas das regras e contabilizadas pelo consumidor/monitoramento; não são reinterpretadas silenciosamente. O CDC mantém before/after para auditoria e o pipeline trata `op=d` e tombstones de acordo com a semântica de deleção.
+### Decisões técnicas e trade-offs
 
-## EDA / validação de hipóteses
+| Decisão | Por quê | Trade-off aceito |
+|---|---|---|
+| **CDC em vez de polling** | Lê o log de transações, preserva a semântica de insert/update/delete e evita consultas repetidas à origem | Exige replicação lógica, slot ativo e monitoramento de WAL |
+| **Avro + Schema Registry** | Contratos evolutivos verificáveis e payloads tipados, sem PAN/CVV | Exige disciplina de compatibilidade (`BACKWARD`) |
+| **Flink SQL** | Expressa agregação temporal e enriquecimento em SQL, com estado e checkpoints | A semântica de janela e late events precisa ser validada com dados controlados |
+| **Janela `HOP` de 1 s com tamanho de 60 s** | Detecção contínua em janelas deslizantes | Um mesmo episódio gera alertas em janelas adjacentes (ver Limitações) |
+| **Chave estável (`alert_id`) e sink upsert** | Atualizações de uma janela ativa corrigem o alerta sem duplicá-lo | O consumidor precisa ser idempotente |
+| **Service accounts separadas** (conector, Flink, consumidor) | Privilégio mínimo por identidade | Mais ACLs para manter e revisar |
+| **Terraform** | Infraestrutura reproduzível e destruível | O state contém segredos e exige backend remoto criptografado |
 
-Antes de ativar alertas, consulte volume por conta, distribuição de valor e transações por cartão. As consultas estão em [`sql/validation.sql`](sql/validation.sql). A hipótese testada pelo streaming é: “três pagamentos do mesmo cartão dentro de 60 segundos merecem revisão”. Ela não demonstra causalidade nem estima precisão/recall; isso exigiria rótulos de fraude e avaliação offline.
+---
 
-## Contrato de dados
+## 5. Limpeza e qualidade dos dados
 
-Os esquemas Avro de exemplo estão em [`schemas/`](schemas/). O connector gera o envelope CDC registrado no Registry; o schema de pagamento normalizado é usado apenas no exercício isolado de compatibilidade. `card_id` é sintético/tokenizado. Veja [`schemas/README.md`](schemas/README.md) e os comandos em `scripts/`.
+- O seed usa dados sintéticos com IDs fixos e timestamps relativos ao instante da carga.
+- O schema aplica PK, FK, `NOT NULL`, moeda ISO e valores positivos (`amount_minor > 0`), além de `CHECK` para `status`, `risk_tier` e demais domínios.
+- `ALTER TABLE transactions REPLICA IDENTITY FULL` garante que o Debezium inclua a linha anterior (`before`) em UPDATE/DELETE.
+- No stream, mensagens inválidas ou sem os campos necessários são excluídas das regras e contabilizadas no monitoramento. Elas **não** são reinterpretadas silenciosamente.
+- O CDC mantém `before`/`after` para auditoria, e o pipeline trata `op=d` e tombstones conforme a semântica de deleção.
 
-### Framework de 11 etapas, adaptado ao streaming
+## 6. EDA e validação de hipóteses
 
-1. Problema de negócio; 2. baseline sem alerta contínuo; 3. planejamento da solução e componentes; 4. qualidade/limpeza e semântica CDC; 5. EDA e hipóteses verificadas em SQL; 6. preparação/contratos e tipos; 7. regra de processamento Flink no lugar de treinamento de modelo; 8. performance técnica medida por latência/lag e erros; 9. performance de negócio avaliada por revisão, falsos positivos e falsos negativos; 10. operação; 11. storytelling com diagrama, eventos e recomendações. As etapas 8 e 9 não têm números até serem medidas em execução.
+Antes de ativar os alertas, rode [`sql/validation.sql`](sql/validation.sql) na origem: volume e distribuição de valor por `status`/`currency` e candidatos a velocidade por cartão.
 
-## Implementação: camadas do pipeline
+**Hipótese testada pelo streaming:** "três pagamentos autorizados do mesmo cartão em 60 segundos merecem revisão."
 
-### 1. Fundação
+Ela **não** demonstra causalidade e **não** estima precisão/recall. Isso exigiria rótulos de fraude e avaliação offline.
 
-Use [`infra/terraform/`](infra/terraform/) para criar ambiente, cluster, service accounts e ACLs segregadas. Credenciais são exportadas apenas para o shell local e não ficam no Terraform state versionado. O backend remoto do state e sua criptografia devem ser configurados pelo operador em produção. Revise `terraform plan` antes de aplicar: recursos Confluent Cloud podem gerar cobrança.
+## 7. Preparação de dados e contrato
 
-### 2. Contrato
+- Os schemas Avro de exemplo estão em [`schemas/`](schemas/): `payments-value.avsc`, `payments-value-breaking.avsc` e `fraud-alert-value.avsc`.
+- O conector registra automaticamente o envelope CDC Debezium. O schema normalizado `payments-value.avsc` serve **apenas** para o exercício isolado de compatibilidade, num subject de laboratório.
+- Teste esperado: `payments-value.avsc` contra si mesmo retorna `is_compatible: true`. `payments-value-breaking.avsc` (remove `transaction_id`) retorna `false`.
+- `card_id` é sintético/tokenizado e `amount_minor` representa a menor unidade monetária. Um sistema multimoeda deve carregar a escala ISO 4217 explicitamente.
+- Detalhes e comandos em [`schemas/README.md`](schemas/README.md).
 
-Registre os schemas Avro no Schema Registry do ambiente. Rode o teste de compatibilidade antes de publicar uma nova versão. Há exemplos aditivo compatível e remoção incompatível; use os comandos documentados no diretório `schemas/`.
+## 8. Regra de processamento (no lugar de treinamento de modelo)
 
-### 3. Ingestão (CDC)
+Este projeto não treina modelo. A "inteligência" é uma regra determinística em Flink SQL ([`sql/10_alert_sink.sql`](sql/10_alert_sink.sql)):
 
-Suba um PostgreSQL gerenciado com logical replication (`wal_level=logical`) e crie usuário restrito `cdc_user` com permissões de replicação/leitura nas tabelas necessárias. Configure TLS, publicação e slot conforme a plataforma. O conector `PostgresCdcSourceV2` está parametrizado em [`connectors/postgres-cdc.json`](connectors/postgres-cdc.json); `scripts/render_connector.ps1` preenche variáveis sem gravar segredo no arquivo. Confirme os nomes de campos de conexão e opções na versão do conector selecionada no seu cluster antes de criar.
+- agrega por `card_id`/`account_id` em janela `HOP` (passo de 1 s, tamanho de 60 s), considerando só `status = 'authorized'`;
+- emite alerta quando `COUNT(*) >= 3`;
+- enriquece com `risk_tier` da conta via `LEFT JOIN` (`'unknown'` quando não encontrada);
+- publica em `payments.fraud.alerts` com `rule_id = 'CARD_VELOCITY_3_IN_60S'`.
 
-O seed está em [`postgres/init/`](postgres/init/) e é reproduzível. Insira, atualize e exclua uma linha de teste e confirme `op=c`, `op=u`, `op=d` no tópico de origem. Debezium representa delete como evento `d` seguido por tombstone; ambos precisam ser reconhecidos pelo consumidor.
+O `transaction_ts` é o timestamp de evento e o watermark tolera 5 segundos de atraso.
 
-### 4. Processamento (Flink SQL)
+## 9. Performance técnica
 
-Os DDLs e statements estão em [`sql/`](sql/). A consulta de enriquecimento associa pagamentos a contas pelo identificador e a regra `MATCH_RECOGNIZE` emite um alerta para 3+ eventos do mesmo cartão em 60 segundos. Configure o catálogo, região e credenciais no workspace Flink; execute os statements na ordem indicada em `sql/README.md`. O tópico de alertas é `payments.fraud.alerts`.
+Métricas a coletar na execução real (**ainda não medidas**):
 
-### 5. Operação
+- latência ponta a ponta (transação no Postgres até o alerta no tópico);
+- lag do consumidor e do conector;
+- erros de task, estado e idade dos statements Flink;
+- checkpoints concluídos e restart count.
 
-Use `scripts/ops-check.ps1` como checklist de ACLs, métricas e billing. Revise bytes recebidos, lag do consumidor, erros de connector, estado dos statements e taxa de alertas. A tabela de runbook está em [`docs/operations.md`](docs/operations.md); custo só deve ser reportado a partir do Billing API/console para o período e moeda informados.
+## 10. Business performance
 
-## Preparação e execução do zero
+Converta o erro da regra em impacto financeiro, com variáveis validadas pela área de risco:
 
-Requisitos: conta Confluent Cloud com permissão para criar recursos, Terraform, Confluent CLI, PowerShell 7, PostgreSQL gerenciado acessível pelo conector, Schema Registry e Flink disponíveis na região escolhida.
+```
+custo do risco residual = volume revisado × taxa de falso negativo × perda média por incidente
+```
 
-1. Copie `.env.example` para `.env` e preencha localmente. Nunca versione `.env`.
-2. Crie o banco PostgreSQL e habilite replicação lógica/TLS. Aplique `postgres/init/001_schema.sql` e `002_seed.sql` com `psql`.
-3. Em `infra/terraform/`, inicialize, revise `terraform plan` e aplique. Guarde state e outputs sensíveis fora do Git.
-4. Configure Schema Registry e registre schemas seguindo `schemas/README.md`.
-5. Renderize o JSON do conector na memória/arquivo local ignorado pelo Git e crie o connector. Verifique status e eventos `c/u/d`.
-6. Confirme que o connector criou os tópicos CDC, configure Flink e execute `sql/README.md` em ordem. O Flink Cloud expõe tópicos existentes automaticamente como tabelas.
-7. Gere três eventos de teste no mesmo cartão dentro de 60 s; capture a saída do tópico de alerta e as métricas reais em `evidence/`.
-8. Complete os itens de operação, custo e segurança no README, removendo os marcadores de captura apenas depois de anexar evidência verdadeira.
+Nenhuma variável tem valor fictício neste repositório. Sem rótulos de fraude, a taxa de falso negativo não pode ser estimada.
 
-Comandos específicos do provider de PostgreSQL e do connector podem variar por versão. O arquivo de configuração e os exemplos devem ser conferidos com a documentação da versão disponibilizada no seu ambiente antes da criação.
+## 11. Operação e storytelling
 
-Para validar o ciclo CDC sem mexer nos dados de seed, execute [`postgres/test_cdc.sql`](postgres/test_cdc.sql) enquanto o connector estiver ativo e capture cada evento antes da remoção.
+- **Operação:** checklist em [`scripts/ops-check.ps1`](scripts/ops-check.ps1) e runbook em [`docs/operations.md`](docs/operations.md) (observabilidade, segurança, custos, confiabilidade e resposta a falhas).
+- **Storytelling:** o dado nasce como uma linha no Postgres, vira evento CDC, é enriquecido e agregado no Flink e chega como alerta de triagem a quem faz a revisão. Cada etapa pode ser provada com evidência em `evidence/`.
 
-## Resultado, performance e impacto no negócio
+---
 
-Resultado esperado: publicar alertas de triagem em streaming e permitir rastrear o dado até o evento CDC. Latência ponta a ponta, taxa de alerta, falsos positivos e custo mensal permanecem **não medidos** até uma execução real. Não há benchmark ou economia financeira fictícia neste repositório. Para business performance, estime `custo do risco residual = volume revisado × taxa de falso negativo × perda média por incidente`; substitua cada variável por métricas validadas pela área de risco.
+## Insights de engenharia
+
+- O conector gerenciado **não** alcança `localhost`. A prova local vale para validar o Postgres e o seed, mas o CDC exige um endpoint acessível.
+- Delete no Debezium é um evento `d` **seguido de um tombstone**. O consumidor precisa tratar os dois.
+- Sem chave primária declarada na tabela de origem do Flink, UPDATE/DELETE do CDC não atualiza o estado da agregação.
+- Com sink upsert, a idempotência do consumidor não é opcional.
+- `publication.autocreate.mode=disabled` exige que a publicação exista antes do conector ([`postgres/publication.sql`](postgres/publication.sql)).
+
+---
+
+## Estrutura do repositório
+
+```
+.
+├── connectors/      # modelo do conector PostgresCdcSourceV2 e README
+├── docs/            # arquitetura, operação/runbook e referências
+├── evidence/        # checklist de evidências reais (captures/ ignorada pelo Git)
+├── infra/terraform/ # ambiente, cluster, service accounts, API keys e ACLs
+├── postgres/        # init/ (schema e seed), publication.sql, test_cdc.sql
+├── schemas/         # contratos Avro e guia de compatibilidade
+├── scripts/         # setup, render do conector, Schema Registry e ops-check
+├── sql/             # statements Flink (fontes, sink de alertas) e validação
+├── .env.example
+└── LICENSE
+```
+
+## Como executar
+
+**Pré-requisitos:** conta Confluent Cloud com permissão para criar recursos, Terraform `>= 1.6`, Confluent CLI, PowerShell 7, PostgreSQL gerenciado acessível pelo conector (TLS e replicação lógica) e Schema Registry e Flink disponíveis na região escolhida.
+
+1. Copie `.env.example` para `.env` e preencha localmente. Nunca versione o `.env`.
+2. Crie o banco PostgreSQL com replicação lógica e TLS. Aplique `postgres/init/001_schema.sql` e `002_seed.sql` com `psql`, depois `postgres/publication.sql` como dono do banco.
+3. Em `infra/terraform/`, copie `terraform.tfvars.example` para `terraform.tfvars`, rode `terraform init` e `terraform plan`, revise o plano e aplique (ou use `scripts/setup.ps1`, adicionando `-Apply` para criar). Guarde state e outputs sensíveis fora do Git.
+4. Valide os contratos com `scripts/schema-registry.ps1` (ações `check`, `compatibility` e `register`), seguindo `schemas/README.md`.
+5. Renderize o JSON do conector com `scripts/render_connector.ps1` (o arquivo gerado é ignorado pelo Git e contém segredos) e crie o conector. Confirme o status e os eventos `c`/`u`/`d`.
+6. Confirme que o conector criou os tópicos CDC e execute `sql/00_sources.sql` e `sql/10_alert_sink.sql` no workspace Flink, na ordem de [`sql/README.md`](sql/README.md). Ajuste os nomes de tabela ao que o `SHOW TABLES` exibir.
+7. Gere três transações autorizadas no mesmo cartão em menos de 60 s. Capture o alerta do tópico `payments.fraud.alerts` e as métricas reais em `evidence/`.
+8. Para validar o ciclo CDC sem mexer no seed, execute [`postgres/test_cdc.sql`](postgres/test_cdc.sql) com o conector ativo e capture cada evento antes da remoção.
+
+> Propriedades do conector e comandos específicos do provider de PostgreSQL variam por versão. Confira a documentação da versão disponível no seu ambiente (veja [`docs/references.md`](docs/references.md)).
 
 ## Evidências de execução
 
-O PDF de referência pede evidência por camada. Use o checklist em [`evidence/README.md`](evidence/README.md) para coletar comandos, eventos e métricas reais. A pasta não contém evidências simuladas. Antes da submissão final, acrescente capturas higienizadas de: ambiente/cluster e ACLs, compatibilidade Schema Registry, eventos CDC insert/update/delete, alerta Flink mais as transações que o dispararam, métricas, billing e teardown vazio.
+Use o checklist de [`evidence/README.md`](evidence/README.md) para coletar comandos, eventos e métricas **reais**, sanitizados. A pasta não contém evidências simuladas. Antes da submissão final, anexe capturas de:
+
+- [ ] ambiente, cluster e ACLs
+- [ ] compatibilidade no Schema Registry (positivo e negativo)
+- [ ] eventos CDC insert, update (`before`/`after`) e delete + tombstone
+- [ ] statement Flink em RUNNING, alerta e as três transações que o dispararam
+- [ ] métricas de operação (throughput, lag, erros, checkpoints)
+- [ ] billing (valor, período, moeda, créditos)
+- [ ] teardown com listagem final sem recursos
 
 ## Segurança e privacidade
 
-- Segredos apenas em variáveis locais/secret manager; `.env`, state e arquivos renderizados estão ignorados.
-- Service accounts separadas por produtor e consumidor com ACLs limitadas a tópicos/grupos necessários.
-- TLS para PostgreSQL; usuário CDC dedicado; retenção e acesso revistos antes de produção.
-- Dados sintéticos; não use PAN/CVV nem dados pessoais reais.
+- Segredos só em variáveis locais ou secret manager. `.env`, state e arquivos renderizados estão no `.gitignore`.
+- Service accounts separadas por conector, Flink e consumidor, com ACLs limitadas a tópicos e grupos necessários.
+- TLS `verify-full` para o PostgreSQL e usuário CDC dedicado. Evite allowlist de IP aberta e monitore slots inativos (crescimento de WAL).
+- Dados sintéticos: não use PAN, CVV nem dados pessoais reais.
 - Faça rotação e revogação das chaves após o laboratório.
 
 ## Custos e teardown
 
-Não há preço fixo confiável sem região, plano, throughput e duração. Registre o custo observado no Billing para o intervalo do laboratório, moeda, componentes e eventuais créditos. Destrua recursos com `terraform destroy` depois de remover connector e statements; confirme que cluster, connector, tópicos e statements não permanecem ativos. Uma janela de billing pode continuar refletindo uso anterior após o teardown.
+Não há preço fixo confiável sem região, plano, throughput e duração. Registre o custo observado no Billing (intervalo, moeda, componentes e créditos).
+
+Para encerrar: pare os statements Flink, pause e delete o conector, remova as credenciais do laboratório e rode `terraform destroy` em `infra/terraform/`. Confirme no console que cluster, ACLs, service accounts, conector e statements sumiram. O banco de origem criado para o lab deve ser destruído separadamente. A janela de billing pode refletir uso anterior após o teardown.
+
+## Aprendizados
+
+- **O mais difícil:** alinhar a semântica do CDC (envelope, tombstone, `REPLICA IDENTITY`) com o changelog do Flink. A saída é validar com dados controlados antes de confiar na regra.
+- **O que faria diferente:** definir desde o início a política de supressão de alertas por episódio e a DLQ, em vez de deixá-las como pendências.
+- **Princípio adotado:** nenhuma evidência, métrica ou custo é escrito sem execução real. Um README que declara o que **não** foi medido é mais confiável do que um com números inventados.
+
+## Limitações conhecidas
+
+- A janela `HOP` de 1 s gera alertas em janelas adjacentes para o mesmo episódio (a chave `alert_id` é cartão + início da janela). Para um único alerta por episódio, implemente deduplicação ou supressão explícita.
+- A regra é heurística e sem avaliação de precisão/recall.
+- Atrasos maiores que a tolerância do watermark (5 s) podem ser descartados conforme o runtime.
+- É um laboratório: ambientes separados, SLOs, rotação de segredos, DR e retenção ficam para produção.
 
 ## Próximos passos
 
 1. Adicionar DLQ e política de replay para eventos inválidos.
-2. Avaliar outras regras com rótulos de fraude, medir precisão/recall e calibrar limiares com a equipe de risco.
-3. Adicionar idempotência no consumidor e deduplicação usando chave do evento.
-4. Materializar dados analíticos em Iceberg/Tableflow e aplicar política de retenção.
+2. Avaliar a regra com rótulos de fraude, medir precisão/recall e calibrar limiares com a equipe de risco.
+3. Implementar idempotência no consumidor e supressão de alertas por episódio.
+4. Materializar dados analíticos em Iceberg/Tableflow, com política de retenção.
 5. Adicionar score de risco versionado, com explicabilidade e monitoramento de drift.
+
+## Referências
+
+Veja [`docs/references.md`](docs/references.md), [`docs/architecture.md`](docs/architecture.md) e [`docs/operations.md`](docs/operations.md).
 
 ## Licença
 
@@ -145,5 +253,3 @@ MIT. Consulte [`LICENSE`](LICENSE).
 
 [![Portfólio Sérgio Santos](https://img.shields.io/badge/Portfólio-Sérgio_Santos-111827?style=for-the-badge&logo=githubpages&logoColor=00eaff)](https://portfoliosantossergio.vercel.app)
 [![LinkedIn Sérgio Santos](https://img.shields.io/badge/LinkedIn-Sérgio_Santos-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white)](https://linkedin.com/in/santossergioluiz)
-
-
