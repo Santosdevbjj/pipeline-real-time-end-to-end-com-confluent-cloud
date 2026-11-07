@@ -9,9 +9,7 @@
 Chegou a hora de montar um pipeline de pagamentos que roda em tempo real no Confluent Cloud. 
 
 > Você leva os dados de um Postgres para o streaming por CDC, processa com Flink SQL para enriquecer as transações e marcar as suspeitas, e entrega o resultado para quem vai consumir. 
-
 > São cinco camadas, da fundação do ambiente até a operação com métricas e custo, e os dados sintéticos já vêm prontos para você começar. 
-
 > No fim, você publica um repositório no GitHub com o README documentando camada por camada, com a evidência de que cada uma rodou.
 
 
