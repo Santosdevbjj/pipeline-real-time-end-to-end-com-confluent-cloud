@@ -1,0 +1,5 @@
+cloud_provider      = "AWS"
+region              = "us-east-1"
+environment_name    = "payments-lab"
+cluster_name        = "payments-basic"
+cluster_availability = "SINGLE_ZONE"

@@ -1,0 +1,29 @@
+{
+  "name": "payments-postgres-cdc",
+  "config": {
+    "connector.class": "PostgresCdcSourceV2",
+    "name": "payments-postgres-cdc",
+    "kafka.auth.mode": "KAFKA_API_KEY",
+    "kafka.api.key": "${file:/secrets:KAFKA_API_KEY}",
+    "kafka.api.secret": "${file:/secrets:KAFKA_API_SECRET}",
+    "database.hostname": "${file:/secrets:POSTGRES_HOST}",
+    "database.port": "5432",
+    "database.user": "${file:/secrets:POSTGRES_USER}",
+    "database.password": "${file:/secrets:POSTGRES_PASSWORD}",
+    "database.dbname": "payments",
+    "database.server.name": "payments-pg",
+    "database.sslmode": "verify-full",
+    "topic.prefix": "payments",
+    "plugin.name": "pgoutput",
+    "publication.name": "payments_cdc",
+    "publication.autocreate.mode": "disabled",
+    "slot.name": "payments_cdc_slot",
+    "table.include.list": "public.accounts,public.transactions",
+    "snapshot.mode": "initial",
+    "heartbeat.interval.ms": "60000",
+    "tombstones.on.delete": "true",
+    "output.data.format": "AVRO",
+    "output.key.format": "AVRO",
+    "tasks.max": "1"
+  }
+}

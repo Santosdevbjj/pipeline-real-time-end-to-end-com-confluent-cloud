@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+*.tfstate
+*.tfstate.*
+.terraform/
+terraform.tfvars
+*.auto.tfvars
+connectors/*rendered*.json
+evidence/captures/*
+!evidence/captures/.gitkeep
+*.pem
+*.key
